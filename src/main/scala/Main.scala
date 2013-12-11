@@ -20,6 +20,10 @@ import spray.io._
 import javax.net.ssl._
 import java.security.cert._
 import java.security.{SecureRandom, KeyStore}
+import akka.util.Timeout
+import spray.http._
+import HttpMethods._
+import spray.can.Http._
 
 object Main extends App {
 
@@ -36,7 +40,9 @@ object Main extends App {
 
     class IgnoreX509TrustManager extends X509TrustManager {
       def checkClientTrusted(chain: Array[X509Certificate], authType: String) {}
+
       def checkServerTrusted(chain: Array[X509Certificate], authType: String) {}
+
       def getAcceptedIssuers = null
     }
 
@@ -47,27 +53,35 @@ object Main extends App {
 
   }
 
-  implicit val trustEngineProvider = ClientSSLEngineProvider { engine =>
-    engine.setEnabledCipherSuites(Array("TLS_RSA_WITH_AES_256_CBC_SHA"))
-    engine.setEnabledProtocols(Array("SSLv3", "TLSv1"))
-    log.info("trustEngineProvider")
-    engine
-  }
+  implicit val clientSSLEngineProvider =
+    ClientSSLEngineProvider {
+      _ =>
+        val engine = trustfulSslContext.createSSLEngine()
+        engine.setUseClientMode(true)
+        engine
+    }
 
   log.info("Requesting...")
 
-  val pipeline = sendReceive ~> unmarshal[String]
-  val responseFuture = pipeline {
-    Post("https://api-sandbox.direct.yandex.ru/json-api/v4/", "{}")
-  }
-  responseFuture onComplete {
-    case Success(q) =>
-      log.info(q)
-      shutdown()
+  private implicit val timeout: Timeout = 5.seconds
 
-    case Failure(error) =>
-      log.error(error, "Couldn't get elevation")
-      shutdown()
+  val connector = HostConnectorSetup(host = "api-sandbox.direct.yandex.ru", port = 443, sslEncryption = true)
+
+  val hQuery = Post("/json-api/v4/", "{}")
+
+  for {
+    Http.HostConnectorInfo(hostConnector, _) <- IO(Http) ? connector
+    response <- hostConnector.ask(hQuery).mapTo[HttpResponse]
+    _ <- hostConnector ? Http.CloseAll
+  } yield {
+
+    system.log.info("Host-Level API: received {} response with {} bytes",
+      response.status, response.entity.data.length)
+
+    response.header[HttpHeaders.Server].get.products.head
+    println(s"body: ${response.entity.data.asString}")
+
+    shutdown()
   }
 
 
